@@ -11,6 +11,7 @@ on:
         options:
           - seed
           - fetch
+          - backfill-seasons
           - report
 
 jobs:
