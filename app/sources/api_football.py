@@ -56,17 +56,33 @@ class APIFootballClient:
         if remaining_wait > 0:
             time.sleep(remaining_wait)
 
-    def _log_quota(self, headers) -> None:
-        limit = headers.get("x-ratelimit-requests-limit")
-        remaining = headers.get("x-ratelimit-requests-remaining")
-        if limit is None or remaining is None:
-            return
-        logger.info("API Football kota: %s/%s istek kaldı", remaining, limit)
-        try:
-            if int(remaining) <= QUOTA_WARNING_THRESHOLD:
-                logger.warning("API Football günlük kota sınırına yaklaşıldı: %s/%s kaldı", remaining, limit)
-        except ValueError:
-            pass
+    def _log_quota(self, headers, status_code: int) -> None:
+        """Günlük ve dakikalık kotayı ayrı ayrı loglar.
+
+        API-Football iki farklı başlık çifti döner: "requests" geçen isimler
+        günlük kotayı, geçmeyenler dakikalık kotayı gösterir. İkisi
+        karıştırılırsa (örn. dakikalık sayaç günlük sanılırsa) kota normalde
+        düşerken aniden yükseliyormuş gibi görünür — bu yüzden ikisi burada
+        açıkça ayrı etiketlerle loglanır.
+        """
+        tag = "" if status_code == 200 else f" [HTTP {status_code} yanıtı, güvenilir olmayabilir]"
+
+        daily_limit = headers.get("x-ratelimit-requests-limit")
+        daily_remaining = headers.get("x-ratelimit-requests-remaining")
+        if daily_limit is not None and daily_remaining is not None:
+            logger.info("API Football günlük kota: %s/%s kaldı%s", daily_remaining, daily_limit, tag)
+            try:
+                if int(daily_remaining) <= QUOTA_WARNING_THRESHOLD:
+                    logger.warning(
+                        "API Football günlük kota sınırına yaklaşıldı: %s/%s kaldı", daily_remaining, daily_limit
+                    )
+            except ValueError:
+                pass
+
+        minute_limit = headers.get("X-RateLimit-Limit")
+        minute_remaining = headers.get("X-RateLimit-Remaining")
+        if minute_limit is not None and minute_remaining is not None:
+            logger.info("API Football dakikalık kota: %s/%s kaldı%s", minute_remaining, minute_limit, tag)
 
     def _get(self, path: str, params: dict) -> dict:
         url = f"{BASE_URL}{path}"
@@ -85,12 +101,20 @@ class APIFootballClient:
             finally:
                 self._last_request_at = time.monotonic()
 
-            self._log_quota(response.headers)
+            self._log_quota(response.headers, response.status_code)
 
             if response.status_code == 429:
-                retry_after = int(response.headers.get("Retry-After", INITIAL_BACKOFF_SECONDS * (2 ** (attempt - 1))))
-                logger.warning("429 alındı, %s saniye bekleniyor (deneme %s/%s)", retry_after, attempt, MAX_RETRIES)
-                time.sleep(retry_after)
+                backoff = INITIAL_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                retry_after_header = response.headers.get("Retry-After")
+                if retry_after_header is not None:
+                    try:
+                        backoff = int(retry_after_header)
+                    except ValueError:
+                        # Retry-After bir HTTP-tarihi de olabilir (RFC 7231);
+                        # ayrıştıramazsak hesaplanan backoff'a düş, çökme.
+                        logger.warning("Retry-After ayrıştırılamadı: %r, hesaplanan bekleme kullanılıyor", retry_after_header)
+                logger.warning("429 alındı, %s saniye bekleniyor (deneme %s/%s)", backoff, attempt, MAX_RETRIES)
+                time.sleep(backoff)
                 continue
 
             if response.status_code >= 500:

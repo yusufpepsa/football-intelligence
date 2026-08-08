@@ -42,9 +42,10 @@ def _season_for(today: date, api_football_league_id: int) -> int:
 
 def cmd_seed() -> None:
     engine = get_engine()
+    inserted = 0
     with engine.begin() as conn:
         for league in LEAGUES:
-            conn.execute(
+            result = conn.execute(
                 text(
                     """
                     INSERT INTO leagues (name, country, api_football_id, fd_code)
@@ -59,7 +60,12 @@ def cmd_seed() -> None:
                     "fd_code": league["fd_code"],
                 },
             )
-    logger.info("%s lig eklendi/kontrol edildi.", len(LEAGUES))
+            inserted += result.rowcount
+    already_present = len(LEAGUES) - inserted
+    logger.info(
+        "%s lig eklendi, %s zaten vardı (toplam %s lig tanımlı).",
+        inserted, already_present, len(LEAGUES),
+    )
 
 
 def _get_or_create_team(conn, league_id: int, api_football_id: int, name: str) -> int:
@@ -122,14 +128,54 @@ def _upsert_fixture(conn, league_id: int, item: dict) -> None:
     )
 
 
+def _process_league(engine, client: APIFootballClient, league, today: date, date_to: date) -> int:
+    season = _season_for(today, league["api_football_id"])
+    logger.info(
+        "Fikstür çekiliyor: %s (api_football_id=%s, season=%s)",
+        league["name"], league["api_football_id"], season,
+    )
+
+    payload = client.get_fixtures(
+        league_api_football_id=league["api_football_id"],
+        season=season,
+        date_from=today,
+        date_to=date_to,
+    )
+
+    try:
+        save_raw_response(payload, prefix=f"fixtures_league{league['api_football_id']}")
+    except OSError as exc:
+        logger.warning("Ham yanıt diske yazılamadı (%s): %s", league["name"], exc)
+
+    fixtures = payload.get("response", [])
+    logger.info("%s: %s maç döndü.", league["name"], len(fixtures))
+
+    with engine.begin() as conn:
+        for item in fixtures:
+            try:
+                with conn.begin_nested():
+                    _upsert_fixture(conn, league_id=league["id"], item=item)
+            except Exception as exc:
+                fixture_id = (item.get("fixture") or {}).get("id", "?")
+                logger.warning("Fikstür işlenemedi (id=%s): %s", fixture_id, exc)
+
+    return len(fixtures)
+
+
 def cmd_fetch() -> None:
     engine = get_engine()
     client = APIFootballClient()
 
     with engine.begin() as conn:
         active_leagues = conn.execute(
-            text("SELECT id, api_football_id, name FROM leagues WHERE is_active = true")
+            text("SELECT id, api_football_id, name FROM leagues WHERE is_active = true ORDER BY id")
         ).mappings().all()
+
+    logger.info(
+        "%s aktif lig bulundu: %s",
+        len(active_leagues),
+        ", ".join(f"{l['name']} (id={l['id']})" for l in active_leagues) or "-",
+    )
 
     if not active_leagues:
         logger.warning("Aktif lig bulunamadı. Önce 'make seed' çalıştırılmalı.")
@@ -140,38 +186,46 @@ def cmd_fetch() -> None:
 
     total_fixtures = 0
     for league in active_leagues:
-        season = _season_for(today, league["api_football_id"])
-        logger.info(
-            "Fikstür çekiliyor: %s (api_football_id=%s, season=%s)",
-            league["name"], league["api_football_id"], season,
-        )
         try:
-            payload = client.get_fixtures(
-                league_api_football_id=league["api_football_id"],
-                season=season,
-                date_from=today,
-                date_to=date_to,
-            )
-        except APIFootballError as exc:
-            logger.error("Fikstür çekilemedi (%s): %s", league["name"], exc)
+            total_fixtures += _process_league(engine, client, league, today, date_to)
+        except Exception as exc:
+            # Bir ligin başarısız olması diğerlerinin işlenmesini engellemez.
+            logger.error("Lig işlenemedi (%s): %s", league["name"], exc)
             continue
 
-        save_raw_response(payload, prefix=f"fixtures_league{league['api_football_id']}")
-
-        fixtures = payload.get("response", [])
-        logger.info("%s: %s maç döndü.", league["name"], len(fixtures))
-
-        with engine.begin() as conn:
-            for item in fixtures:
-                try:
-                    _upsert_fixture(conn, league_id=league["id"], item=item)
-                except (KeyError, TypeError) as exc:
-                    fixture_id = (item.get("fixture") or {}).get("id", "?")
-                    logger.warning("Fikstür işlenemedi (id=%s): %s", fixture_id, exc)
-
-        total_fixtures += len(fixtures)
-
     logger.info("Toplam %s maç işlendi.", total_fixtures)
+
+
+def cmd_report() -> None:
+    engine = get_engine()
+    with engine.begin() as conn:
+        leagues = conn.execute(
+            text("SELECT id, name, country, api_football_id, is_active FROM leagues ORDER BY id")
+        ).mappings().all()
+
+        for league in leagues:
+            stats = conn.execute(
+                text(
+                    """
+                    SELECT count(*) AS n, min(kickoff_utc) AS earliest, max(kickoff_utc) AS latest
+                    FROM fixtures WHERE league_id = :league_id
+                    """
+                ),
+                {"league_id": league["id"]},
+            ).mappings().one()
+
+            sample_teams = conn.execute(
+                text("SELECT name FROM teams WHERE league_id = :league_id ORDER BY id LIMIT 3"),
+                {"league_id": league["id"]},
+            ).scalars().all()
+
+            status = "" if league["is_active"] else " [PASİF]"
+            print(f"{league['name']} ({league['country']}, api_football_id={league['api_football_id']}, league_id={league['id']}){status}")
+            print(f"  maç sayısı: {stats['n']}")
+            if stats["n"]:
+                print(f"  en erken: {stats['earliest']}  en geç: {stats['latest']}")
+            print(f"  örnek takımlar: {', '.join(sample_teams) if sample_teams else '(yok)'}")
+            print()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -179,6 +233,7 @@ def main(argv: list[str] | None = None) -> int:
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("seed", help="Lig listesini veritabanına yükle")
     subparsers.add_parser("fetch", help="Önümüzdeki günlerin maçlarını çek")
+    subparsers.add_parser("report", help="Lig başına maç/takım özetini yazdır")
 
     args = parser.parse_args(argv)
 
@@ -187,6 +242,8 @@ def main(argv: list[str] | None = None) -> int:
             cmd_seed()
         elif args.command == "fetch":
             cmd_fetch()
+        elif args.command == "report":
+            cmd_report()
     except APIFootballError as exc:
         logger.error("API Football hatası: %s", exc)
         return 1
