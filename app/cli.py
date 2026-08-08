@@ -14,6 +14,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 FETCH_DAYS_AHEAD = 7
+BACKFILL_SEASONS = [2023, 2024, 2025, 2026]
 
 # API-Football fixture.status.short -> fixtures.status
 STATUS_MAP = {
@@ -128,6 +129,27 @@ def _upsert_fixture(conn, league_id: int, item: dict) -> None:
     )
 
 
+def _ingest_fixtures_payload(engine, league, payload: dict) -> int:
+    """Ham yanıtı arşivler, fikstürleri (ve takımları) upsert eder. Döner: işlenen maç sayısı."""
+    try:
+        save_raw_response(payload, prefix=f"fixtures_league{league['api_football_id']}")
+    except OSError as exc:
+        logger.warning("Ham yanıt diske yazılamadı (%s): %s", league["name"], exc)
+
+    fixtures = payload.get("response", [])
+
+    with engine.begin() as conn:
+        for item in fixtures:
+            try:
+                with conn.begin_nested():
+                    _upsert_fixture(conn, league_id=league["id"], item=item)
+            except Exception as exc:
+                fixture_id = (item.get("fixture") or {}).get("id", "?")
+                logger.warning("Fikstür işlenemedi (id=%s): %s", fixture_id, exc)
+
+    return len(fixtures)
+
+
 def _process_league(engine, client: APIFootballClient, league, today: date, date_to: date) -> int:
     season = _season_for(today, league["api_football_id"])
     logger.info(
@@ -142,24 +164,16 @@ def _process_league(engine, client: APIFootballClient, league, today: date, date
         date_to=date_to,
     )
 
-    try:
-        save_raw_response(payload, prefix=f"fixtures_league{league['api_football_id']}")
-    except OSError as exc:
-        logger.warning("Ham yanıt diske yazılamadı (%s): %s", league["name"], exc)
+    n = _ingest_fixtures_payload(engine, league, payload)
+    logger.info("%s: %s maç döndü.", league["name"], n)
+    return n
 
-    fixtures = payload.get("response", [])
-    logger.info("%s: %s maç döndü.", league["name"], len(fixtures))
 
-    with engine.begin() as conn:
-        for item in fixtures:
-            try:
-                with conn.begin_nested():
-                    _upsert_fixture(conn, league_id=league["id"], item=item)
-            except Exception as exc:
-                fixture_id = (item.get("fixture") or {}).get("id", "?")
-                logger.warning("Fikstür işlenemedi (id=%s): %s", fixture_id, exc)
-
-    return len(fixtures)
+def _process_league_season(engine, client: APIFootballClient, league, season: int) -> int:
+    """Belirtilen sezonun tamamını çeker (tarih aralığı yok - API-Football league+season için
+    sezonun tüm fikstürlerini döner)."""
+    payload = client.get_fixtures(league_api_football_id=league["api_football_id"], season=season)
+    return _ingest_fixtures_payload(engine, league, payload)
 
 
 def cmd_fetch() -> None:
@@ -196,6 +210,49 @@ def cmd_fetch() -> None:
     logger.info("Toplam %s maç işlendi.", total_fixtures)
 
 
+def cmd_backfill_seasons() -> None:
+    """specs/000-veri-katmani.md: geçmiş sezonların tamamını (tarih penceresi olmadan) çeker.
+
+    Sezon numaraları (2023-2026) her lig için AYNI şekilde kullanılır. API-Football'da
+    "season" parametresi her zaman sezonun başladığı yılı ifade eder; yaz-kış arası
+    oynanan liglerde (bkz. CROSS_YEAR_SEASON_LEAGUES) de bu numaralandırma aynıdır -
+    örn. season=2023, İsviçre için Temmuz 2023 - Haziran 2024 sezonunu getirir.
+    Burada ekstra bir dönüşüm gerekmez; _season_for() sadece günlük fetch'te "bugün
+    hangi sezondayız" tahmini için kullanılıyor, burada sezonlar açıkça verildiği için
+    kullanılmıyor.
+    """
+    engine = get_engine()
+    client = APIFootballClient()
+
+    with engine.begin() as conn:
+        active_leagues = conn.execute(
+            text("SELECT id, api_football_id, name FROM leagues WHERE is_active = true ORDER BY id")
+        ).mappings().all()
+
+    logger.info(
+        "%s aktif lig bulundu: %s",
+        len(active_leagues),
+        ", ".join(f"{l['name']} (id={l['id']})" for l in active_leagues) or "-",
+    )
+
+    if not active_leagues:
+        logger.warning("Aktif lig bulunamadı. Önce 'make seed' çalıştırılmalı.")
+        return
+
+    total_fixtures = 0
+    for league in active_leagues:
+        for season in BACKFILL_SEASONS:
+            try:
+                n = _process_league_season(engine, client, league, season)
+            except Exception as exc:
+                logger.error("Lig/sezon işlenemedi (%s, sezon=%s): %s", league["name"], season, exc)
+                continue
+            logger.info("%s sezon %s: %s maç geldi.", league["name"], season, n)
+            total_fixtures += n
+
+    logger.info("Toplam %s maç işlendi (backfill-seasons).", total_fixtures)
+
+
 def cmd_report() -> None:
     engine = get_engine()
     with engine.begin() as conn:
@@ -203,29 +260,36 @@ def cmd_report() -> None:
             text("SELECT id, name, country, api_football_id, is_active FROM leagues ORDER BY id")
         ).mappings().all()
 
-        for league in leagues:
-            stats = conn.execute(
-                text(
-                    """
-                    SELECT count(*) AS n, min(kickoff_utc) AS earliest, max(kickoff_utc) AS latest
-                    FROM fixtures WHERE league_id = :league_id
-                    """
-                ),
-                {"league_id": league["id"]},
-            ).mappings().one()
+    print(f"{len(leagues)} lig bulundu.\n", flush=True)
 
-            sample_teams = conn.execute(
-                text("SELECT name FROM teams WHERE league_id = :league_id ORDER BY id LIMIT 3"),
-                {"league_id": league["id"]},
-            ).scalars().all()
+    for league in leagues:
+        try:
+            with engine.begin() as conn:
+                stats = conn.execute(
+                    text(
+                        """
+                        SELECT count(*) AS n, min(kickoff_utc) AS earliest, max(kickoff_utc) AS latest
+                        FROM fixtures WHERE league_id = :league_id
+                        """
+                    ),
+                    {"league_id": league["id"]},
+                ).mappings().one()
+
+                sample_teams = conn.execute(
+                    text("SELECT name FROM teams WHERE league_id = :league_id ORDER BY id LIMIT 3"),
+                    {"league_id": league["id"]},
+                ).scalars().all()
 
             status = "" if league["is_active"] else " [PASİF]"
-            print(f"{league['name']} ({league['country']}, api_football_id={league['api_football_id']}, league_id={league['id']}){status}")
-            print(f"  maç sayısı: {stats['n']}")
+            print(f"{league['name']} ({league['country']}, api_football_id={league['api_football_id']}, league_id={league['id']}){status}", flush=True)
+            print(f"  maç sayısı: {stats['n']}", flush=True)
             if stats["n"]:
-                print(f"  en erken: {stats['earliest']}  en geç: {stats['latest']}")
-            print(f"  örnek takımlar: {', '.join(sample_teams) if sample_teams else '(yok)'}")
-            print()
+                print(f"  en erken: {stats['earliest']}  en geç: {stats['latest']}", flush=True)
+            print(f"  örnek takımlar: {', '.join(sample_teams) if sample_teams else '(yok)'}", flush=True)
+            print(flush=True)
+        except Exception as exc:
+            # Bir lig için özet alınamaması diğerlerinin basılmasını engellemesin.
+            print(f"  HATA: {league['name']} için özet alınamadı: {exc}\n", flush=True)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -233,6 +297,7 @@ def main(argv: list[str] | None = None) -> int:
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("seed", help="Lig listesini veritabanına yükle")
     subparsers.add_parser("fetch", help="Önümüzdeki günlerin maçlarını çek")
+    subparsers.add_parser("backfill-seasons", help="Son 4 sezonun (2023-2026) fikstürlerini çek")
     subparsers.add_parser("report", help="Lig başına maç/takım özetini yazdır")
 
     args = parser.parse_args(argv)
@@ -242,6 +307,8 @@ def main(argv: list[str] | None = None) -> int:
             cmd_seed()
         elif args.command == "fetch":
             cmd_fetch()
+        elif args.command == "backfill-seasons":
+            cmd_backfill_seasons()
         elif args.command == "report":
             cmd_report()
     except APIFootballError as exc:

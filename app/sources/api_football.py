@@ -39,15 +39,24 @@ class APIFootballClient:
         self.session = session or requests.Session()
         self._last_request_at: float = 0.0
 
-    def get_fixtures(self, league_api_football_id: int, season: int, date_from: date, date_to: date) -> dict:
-        """/fixtures uç noktası. Belirtilen lig ve tarih aralığındaki maçları döner."""
-        params = {
-            "league": league_api_football_id,
-            "season": season,
-            "from": date_from.isoformat(),
-            "to": date_to.isoformat(),
-            "timezone": "UTC",
-        }
+    def get_fixtures(
+        self,
+        league_api_football_id: int,
+        season: int,
+        date_from: date | None = None,
+        date_to: date | None = None,
+    ) -> dict:
+        """/fixtures uç noktası.
+
+        date_from/date_to verilirse o aralıkla sınırlar (günlük fetch).
+        Verilmezse API-Football league+season için sezonun tamamını döner
+        (geçmiş sezon backfill'i için).
+        """
+        params = {"league": league_api_football_id, "season": season, "timezone": "UTC"}
+        if date_from is not None:
+            params["from"] = date_from.isoformat()
+        if date_to is not None:
+            params["to"] = date_to.isoformat()
         return self._get("/fixtures", params)
 
     def _wait_for_rate_limit(self) -> None:
