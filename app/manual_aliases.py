@@ -14,12 +14,12 @@ Format: (fd_code, "teams.name'deki gerçek isim (API-Football)", "football-data.
 Not: "UCD" ↔ "UC Dublin" buraya eklenmedi - boşluksuz önek kontrolü ("ucd" <->
 "ucdublin", skor 0.95) bunu zaten kural olarak çözüyor.
 
-UYARI: Aşağıdaki kayıt gerçek veriye karşı doğrulanmadı (bu ortamda erişim
-yok). Hangi tarafın API-Football hangi tarafın football-data olduğundan emin
-olamadığım için yön yanlış olabilir - `real_name` sütunu teams.name ile
-eşleşmezse backfill-odds "takım bulunamadı" diye loglar, o zaman iki sütunu
-yer değiştir.
+Aşağıdakiler gerçek backfill-odds çalıştırmasının "eşleşmeyen örnekler"
+logundan alındı (bkz. DB ↔ CSV formatındaki log satırları) - yönleri doğrulandı.
 """
 MANUAL_ALIASES = [
-    ("FIN", "KTP", "Kooteepee"),
+    ("FIN", "Kooteepee", "KTP"),
+    ("AUT", "WSG Wattens", "Tirol"),
+    ("ROU", "Sepsi OSK Sfantu Gheorghe", "Sepsi Sf. Gheorghe"),
+    ("POL", "Nieciecza", "Termalica B-B."),
 ]

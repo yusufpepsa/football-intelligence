@@ -695,6 +695,8 @@ def cmd_report() -> None:
 
     print(f"{len(leagues)} lig bulundu.\n", flush=True)
 
+    coverage_summary: list[tuple[str, int, int]] = []  # (lig adı, maç sayısı, kapanış oranı olan)
+
     for league in leagues:
         try:
             with engine.begin() as conn:
@@ -725,17 +727,34 @@ def cmd_report() -> None:
                     {"league_id": league["id"]},
                 ).scalar_one()
 
+            coverage_summary.append((league["name"], stats["n"], odds_coverage))
+            odds_pct = f" (%{100 * odds_coverage / stats['n']:.1f})" if stats["n"] else ""
+
             status = "" if league["is_active"] else " [PASİF]"
             print(f"{league['name']} ({league['country']}, api_football_id={league['api_football_id']}, league_id={league['id']}){status}", flush=True)
             print(f"  maç sayısı: {stats['n']}", flush=True)
             if stats["n"]:
                 print(f"  en erken: {stats['earliest']}  en geç: {stats['latest']}", flush=True)
             print(f"  örnek takımlar: {', '.join(sample_teams) if sample_teams else '(yok)'}", flush=True)
-            print(f"  kapanış oranı olan maç: {odds_coverage}", flush=True)
+            print(f"  kapanış oranı olan maç: {odds_coverage}/{stats['n']}{odds_pct}", flush=True)
             print(flush=True)
         except Exception as exc:
             # Bir lig için özet alınamaması diğerlerinin basılmasını engellemesin.
             print(f"  HATA: {league['name']} için özet alınamadı: {exc}\n", flush=True)
+
+    total_fixtures = sum(n for _, n, _ in coverage_summary)
+    total_odds = sum(odds_n for _, _, odds_n in coverage_summary)
+    total_pct = f"%{100 * total_odds / total_fixtures:.1f}" if total_fixtures else "-"
+
+    print("--- Genel özet ---", flush=True)
+    print(f"Toplam maç: {total_fixtures}", flush=True)
+    print(f"Kapanış oranı olan maç: {total_odds} ({total_pct})", flush=True)
+    print(flush=True)
+    print("Lig bazında kapanış oranı kapsamı:", flush=True)
+    for name, n, odds_n in coverage_summary:
+        pct = f"%{100 * odds_n / n:.1f}" if n else "-"
+        print(f"  {name}: {odds_n}/{n} ({pct})", flush=True)
+    print(flush=True)
 
     with engine.begin() as conn:
         unmatched_stats = conn.execute(
