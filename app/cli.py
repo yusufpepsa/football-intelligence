@@ -10,6 +10,7 @@ from difflib import SequenceMatcher
 from sqlalchemy import text
 
 from app.db import bulk_insert, get_engine
+from app.manual_aliases import MANUAL_ALIASES
 from app.seed_data import CROSS_YEAR_SEASON_LEAGUES, LEAGUES
 from app.sources import football_data
 from app.sources.api_football import APIFootballClient, APIFootballError, save_raw_response
@@ -273,22 +274,46 @@ def cmd_backfill_seasons() -> None:
 
 
 # API-Football/football-data isim farkının en sık nedeni: kulüp tipi kısaltmaları.
-# Asıl çözüm _name_similarity'deki alt-küme kontrolü ("aik" ⊂ "aik stockholm" gibi
-# ekstra kelimeleri de yakalar) ama bu liste yakın-ama-tam-alt-küme-olmayan
-# durumlarda (difflib fallback'i için) ek yardım sağlar.
+# NFKD + kombinleyici işaret temizliği ö/ą/ç gibi çoğu Latin aksanını çözer, ama
+# bazı harfler NFKD'de ayrışmıyor (tek başına, taban+aksan olarak kodlanmamış) -
+# bunlar elle eşlenir. Doğrulandı: å/ą/ć/ę/ń/ó/ś/ź/ż/ă/â/î/ș/ț/ş/ţ zaten NFKD ile
+# çözülüyor, aşağıdakiler çözülmüyor.
+MANUAL_CHAR_MAP = {
+    "ł": "l", "Ł": "L",  # Polonya
+    "ø": "o", "Ø": "O", "æ": "ae", "Æ": "AE",  # Danimarka/Norveç
+    "ß": "ss",  # Almanca/Avusturya
+    "đ": "d", "Đ": "D",
+}
+
+# Asıl çözüm _name_similarity'deki alt-küme/önek kontrolü ("aik" ⊂ "aik stockholm",
+# "varberg" "varbergs"ın öneki gibi ekstra kelime/ek farklarını genel olarak yakalar)
+# ama bu liste yakın-ama-alt-küme-olmayan durumlarda ek yardım sağlar.
 GENERIC_CLUB_TOKENS = {"fc", "sk", "if", "is", "aik", "ff", "bk", "sc", "ac", "rb", "bsc", "ik", "gks", "cfr"}
+
+# Tek harfli/çok kısa kısaltmalar genel önek kuralıyla (min 4 karakter) yakalanamaz -
+# bunlar için elle bilinen açılımlar. Yön önemli değil, her iki tarafta da denenir.
+ABBREVIATION_EXPANSIONS = {"a": "austria", "din": "dinamo", "u": "universitatea", "poli": "politehnica"}
+
 MAX_UNMATCHED_EXAMPLES = 10
 
 
 def _strip_accents(value: str) -> str:
+    for src, dst in MANUAL_CHAR_MAP.items():
+        value = value.replace(src, dst)
     decomposed = unicodedata.normalize("NFKD", value)
     return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
 
 
 def _base_normalize(name: str) -> str:
-    """Küçük harf, aksan temizliği (ö->o, ą->a, ç->c, ...), noktalama temizliği."""
+    """Küçük harf, aksan temizliği (ö->o, ą->a, ç->c, ł->l, ø->o, ...), noktalama temizliği.
+
+    Kesme işareti SİLİNİR (Patrick's -> Patricks, football-data'nın kendi yazımıyla
+    aynı sonucu verir); nokta/tire/eğik çizgi BOŞLUĞA çevrilir (ayrı kelimeler kalsın:
+    "A. Klagenfurt" -> "a klagenfurt", "Bodo/Glimt" -> "bodo glimt").
+    """
     name = _strip_accents(name).lower()
-    name = re.sub(r"[.\-/']", " ", name)
+    name = name.replace("'", "")
+    name = re.sub(r"[.\-/]", " ", name)
     name = re.sub(r"[^a-z0-9\s]", "", name)
     return re.sub(r"\s+", " ", name).strip()
 
@@ -302,17 +327,48 @@ def _strip_generic_tokens(normalized_name: str) -> str:
     return " ".join(words)
 
 
+def _words_equivalent(w1: str, w2: str) -> bool:
+    """Aynı kelime mi, bilinen bir kısaltma açılımı mı, yoksa biri diğerinin öneki mi
+    (min 4 karakter - "a" gibi çok kısa parçaların her şeyle eşleşmesini önler)."""
+    if w1 == w2:
+        return True
+    if ABBREVIATION_EXPANSIONS.get(w1) == w2 or ABBREVIATION_EXPANSIONS.get(w2) == w1:
+        return True
+    shorter, longer = (w1, w2) if len(w1) <= len(w2) else (w2, w1)
+    return len(shorter) >= 4 and longer.startswith(shorter)
+
+
+def _word_set_covers(smaller: set, larger: set) -> bool:
+    """smaller kümesindeki her kelimenin larger'da bir eşi (tam/kısaltma/önek) var mı?"""
+    return all(any(_words_equivalent(w, w2) for w2 in larger) for w in smaller)
+
+
 def _words_overlap_score(a: str, b: str) -> float:
     words_a, words_b = set(a.split()), set(b.split())
-    if words_a and words_b and (words_a <= words_b or words_b <= words_a):
+    if not words_a or not words_b:
+        return 0.0
+    if words_a == words_b:
         return 1.0
+
+    smaller, larger = (words_a, words_b) if len(words_a) <= len(words_b) else (words_b, words_a)
+    if _word_set_covers(smaller, larger):
+        return 1.0
+
+    # Bitişik kısaltmalar için ("UCD" <-> "UC Dublin"): boşluksuz halde biri diğerinin
+    # öneki mi? (min 3 karakter - çok kısa rastgele eşleşmeleri önlemek için)
+    compact_a, compact_b = a.replace(" ", ""), b.replace(" ", "")
+    shorter_c, longer_c = (compact_a, compact_b) if len(compact_a) <= len(compact_b) else (compact_b, compact_a)
+    if len(shorter_c) >= 3 and longer_c.startswith(shorter_c):
+        return 0.95
+
     return SequenceMatcher(None, a, b).ratio()
 
 
 def _name_similarity(raw_a: str, raw_b: str) -> float:
     """0-1 arası benzerlik. Biri diğerinin kelime alt kümesiyse ('aik' ⊂ 'aik stockholm')
-    tam eşleşme sayılır - bu, şehir/kulüp eki gibi farkları elle bir listeye yazmadan çözer.
-    Ayrıca jenerik kulüp tokenleri atılmış hallerinde de aynı kontrol denenir."""
+    ya da öneki/kısaltma açılımıysa ('u' -> 'universitatea') tam eşleşme sayılır - bu,
+    şehir/kulüp eki gibi farkları elle bir listeye yazmadan çözer. Ayrıca jenerik kulüp
+    tokenleri atılmış hallerinde de aynı kontrol denenir, ikisinin iyisi alınır."""
     base_a, base_b = _base_normalize(raw_a), _base_normalize(raw_b)
     if not base_a or not base_b:
         return 0.0
@@ -326,43 +382,94 @@ def _name_similarity(raw_a: str, raw_b: str) -> float:
     return best
 
 
+def _parse_int(value) -> int | None:
+    value = (value or "").strip() if isinstance(value, str) else value
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return None
+
+
+def _scores_consistent(row: dict, fixture) -> bool:
+    """CSV'deki HG/AG (tam maç skoru) ile DB'deki fixture skoru çelişiyor mu?
+
+    İkisinden biri eksikse (maç oynanmamış, veri yok) karşılaştırma yapılamaz -
+    bu durumda reddetmiyoruz, sadece ikisi de VARSA ve ÇELİŞİYORSA reddediyoruz.
+    Bu, isim+tarih eşleşmesi eşiği geçse bile aslında yanlış maça bağlanmış bir
+    eşleşmeyi son bir kontrolle yakalıyor.
+    """
+    csv_home_goals = _parse_int(row.get("HG"))
+    csv_away_goals = _parse_int(row.get("AG"))
+    if csv_home_goals is None or csv_away_goals is None:
+        return True
+    if fixture.home_goals is None or fixture.away_goals is None:
+        return True
+    return csv_home_goals == fixture.home_goals and csv_away_goals == fixture.away_goals
+
+
+def _side_score(raw_name: str, candidate_team_id: int, candidate_team_name: str, alias_map: dict[str, int]) -> float:
+    """Bilinen bir alias varsa (elle girilmiş ya da önceki bir çalıştırmadan öğrenilmiş)
+    o kesin kullanılır: doğru takıma 1.0, yanlış takıma 0.0. Alias yoksa isim benzerliği.
+
+    Bu, "Kooteepee" gibi tek taraflı bilinen bir manuel alias'ın, öbür takım
+    (örn. "HJK") hâlâ normal şekilde çözülürken kullanılabilmesini sağlar -
+    eskiden ikisi de zaten alias olarak bilinmiyorsa hiçbiri alias'tan faydalanamıyordu.
+    """
+    alias_id = alias_map.get(raw_name)
+    if alias_id is not None:
+        return 1.0 if alias_id == candidate_team_id else 0.0
+    return _name_similarity(raw_name, candidate_team_name)
+
+
 def _match_fixture_by_date_and_names(
     home_raw: str,
     away_raw: str,
     match_date: date,
     fixtures_by_date: dict,
     alias_map: dict[str, int],
+    row: dict,
 ) -> tuple:
-    """Önce lig+tarih (±1 gün) ile aday havuzunu küçültür (genelde 2-5 maç),
-    sonra o havuzda isim benzerliğiyle en iyi eşleşmeyi arar.
+    """Önce lig+tarih (±1 gün) ile aday havuzunu küçültür (genelde 2-5 maç), sonra o
+    havuzda isim benzerliğiyle en iyi eşleşmeyi arar. Eşik üstü bir aday bulunsa bile
+    maç skoru (HG/AG) DB'dekiyle çelişiyorsa reddedilir, bir sonraki adaya bakılır.
 
-    Döner: (fixture, skor, en_yakın_aday). Eşleşme bulunursa (fixture, skor, None),
-    bulunamazsa (None, en_iyi_skor, en_yakın_aday_veya_None).
+    Döner: (fixture, skor, en_yakın_aday, ret_nedeni).
+    Eşleşme bulunursa (fixture, skor, None, None).
+    Bulunamazsa (None, en_iyi_skor, en_yakın_aday_veya_None, "skor_uyusmuyor"_veya_None).
     """
     candidates = []
     for offset in (0, -1, 1):
         candidates.extend(fixtures_by_date.get(match_date + timedelta(days=offset), []))
 
     if not candidates:
-        return None, 0.0, None
+        return None, 0.0, None, None
 
-    home_alias_id = alias_map.get(home_raw)
-    away_alias_id = alias_map.get(away_raw)
-    if home_alias_id is not None and away_alias_id is not None:
-        for f in candidates:
-            if f.home_team_id == home_alias_id and f.away_team_id == away_alias_id:
-                return f, 1.0, None
+    scored = sorted(
+        (
+            (
+                min(
+                    _side_score(home_raw, f.home_team_id, f.home_name, alias_map),
+                    _side_score(away_raw, f.away_team_id, f.away_name, alias_map),
+                ),
+                f,
+            )
+            for f in candidates
+        ),
+        key=lambda pair: -pair[0],
+    )
 
-    best_fixture, best_score = None, 0.0
-    for f in candidates:
-        score = min(_name_similarity(home_raw, f.home_name), _name_similarity(away_raw, f.away_name))
-        if score > best_score:
-            best_fixture, best_score = f, score
+    for score, f in scored:
+        if score < FUZZY_MATCH_THRESHOLD:
+            break  # sıralı, eşik altına inince kalanlar da altında
+        if _scores_consistent(row, f):
+            return f, score, None, None
 
-    if best_fixture is not None and best_score >= FUZZY_MATCH_THRESHOLD:
-        return best_fixture, best_score, None
-
-    return None, best_score, best_fixture
+    best_score, best_fixture = scored[0]
+    if best_score >= FUZZY_MATCH_THRESHOLD:
+        return None, best_score, best_fixture, "skor_uyusmuyor"
+    return None, best_score, best_fixture, None
 
 
 def _backfill_league_odds(engine, league) -> tuple[int, int]:
@@ -379,7 +486,7 @@ def _backfill_league_odds(engine, league) -> tuple[int, int]:
             text(
                 """
                 SELECT f.id, f.kickoff_utc, f.home_team_id, f.away_team_id,
-                       ht.name AS home_name, at.name AS away_name
+                       f.home_goals, f.away_goals, ht.name AS home_name, at.name AS away_name
                 FROM fixtures f
                 JOIN teams ht ON ht.id = f.home_team_id
                 JOIN teams at ON at.id = f.away_team_id
@@ -428,8 +535,8 @@ def _backfill_league_odds(engine, league) -> tuple[int, int]:
             })
             continue
 
-        fixture, score, best_candidate = _match_fixture_by_date_and_names(
-            home_raw, away_raw, match_date, fixtures_by_date, alias_map,
+        fixture, score, best_candidate, reason = _match_fixture_by_date_and_names(
+            home_raw, away_raw, match_date, fixtures_by_date, alias_map, row,
         )
 
         if fixture is None:
@@ -439,7 +546,13 @@ def _backfill_league_odds(engine, league) -> tuple[int, int]:
                 "raw_date": match_date, "seen_at": datetime.now(timezone.utc),
             })
             if len(unmatched_examples) < MAX_UNMATCHED_EXAMPLES:
-                if best_candidate is not None:
+                if reason == "skor_uyusmuyor" and best_candidate is not None:
+                    unmatched_examples.append(
+                        f"DB: '{best_candidate.home_name}' {best_candidate.home_goals}-{best_candidate.away_goals} "
+                        f"'{best_candidate.away_name}' ↔ CSV: '{home_raw}' vs '{away_raw}' ({match_date}) - "
+                        f"isim eşleşti (skor={score:.2f}) ama maç skoru tutmuyor, reddedildi"
+                    )
+                elif best_candidate is not None:
                     unmatched_examples.append(
                         f"DB: '{best_candidate.home_name}' vs '{best_candidate.away_name}' "
                         f"↔ CSV: '{home_raw}' vs '{away_raw}' ({match_date}, skor={score:.2f})"
@@ -500,6 +613,41 @@ def _backfill_league_odds(engine, league) -> tuple[int, int]:
     return matched, unmatched
 
 
+def _load_manual_aliases(engine) -> None:
+    """app/manual_aliases.py'deki hiçbir kuralla çözülemeyen eşleştirmeleri yükler."""
+    if not MANUAL_ALIASES:
+        return
+
+    with engine.begin() as conn:
+        rows = []
+        for fd_code, real_name, alias in MANUAL_ALIASES:
+            team = conn.execute(
+                text(
+                    """
+                    SELECT t.id FROM teams t
+                    JOIN leagues l ON l.id = t.league_id
+                    WHERE l.fd_code = :fd_code AND t.name = :real_name
+                    """
+                ),
+                {"fd_code": fd_code, "real_name": real_name},
+            ).first()
+            if team is None:
+                logger.warning(
+                    "Elle alias için takım bulunamadı (fd_code=%s, name=%r) - "
+                    "isim yanlış ya da yön ters olabilir, app/manual_aliases.py'yi kontrol et.",
+                    fd_code, real_name,
+                )
+                continue
+            rows.append({"team_id": team.id, "source": "football_data", "alias": alias})
+
+        bulk_insert(
+            conn, "team_aliases", ["team_id", "source", "alias"], rows,
+            conflict_clause="ON CONFLICT (source, alias) DO NOTHING",
+        )
+    if rows:
+        logger.info("%s elle tanımlı alias yüklendi.", len(rows))
+
+
 def cmd_backfill_odds() -> None:
     """specs/000-veri-katmani.md Adım 4-5: football-data.co.uk'ten kapanış oranı çeker.
 
@@ -507,6 +655,7 @@ def cmd_backfill_odds() -> None:
     app/sources/football_data.py loglar, bu lig atlanır, diğerleri etkilenmez.
     """
     engine = get_engine()
+    _load_manual_aliases(engine)
 
     with engine.begin() as conn:
         active_leagues = conn.execute(
