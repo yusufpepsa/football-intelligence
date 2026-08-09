@@ -22,4 +22,5 @@ MANUAL_ALIASES = [
     ("AUT", "WSG Wattens", "Tirol"),
     ("ROU", "Sepsi OSK Sfantu Gheorghe", "Sepsi Sf. Gheorghe"),
     ("POL", "Nieciecza", "Termalica B-B."),
+    ("FIN", "EIF", "Ekenas"),  # Ekenäs IF
 ]

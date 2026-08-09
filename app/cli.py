@@ -653,6 +653,13 @@ def cmd_backfill_odds() -> None:
 
     Anahtar gerekmez. leagues.fd_code doğrulanmamış olabilir - 404 gelirse
     app/sources/football_data.py loglar, bu lig atlanır, diğerleri etkilenmez.
+
+    unmatched_fixtures'ta league_id yok (bkz. docs/02-data-model.md), yani
+    "bu ligin eski kayıtlarını sil" diye tam hedefli bir silme yapılamıyor.
+    Bunun yerine her çalıştırmada source='football_data' olan TÜM eski
+    kayıtlar silinip bu çalıştırmanın bulduklarıyla yeniden yazılıyor - tablo
+    her zaman "en son çalıştırmadaki gerçek durumu" gösteriyor, önceki
+    denemelerden kalan tekrarlar birikmiyor.
     """
     engine = get_engine()
     _load_manual_aliases(engine)
@@ -667,6 +674,10 @@ def cmd_backfill_odds() -> None:
     if not active_leagues:
         logger.warning("Aktif lig bulunamadı. Önce 'make seed' çalıştırılmalı.")
         return
+
+    with engine.begin() as conn:
+        deleted = conn.execute(text("DELETE FROM unmatched_fixtures WHERE source = 'football_data'")).rowcount
+    logger.info("%s eski eşleşmeyen kayıt temizlendi (bu çalıştırmayla yeniden yazılacak).", deleted)
 
     total_matched = 0
     total_unmatched = 0
