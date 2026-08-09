@@ -12,6 +12,7 @@ on:
           - seed
           - fetch
           - backfill-seasons
+          - backfill-odds
           - report
 
 jobs:
