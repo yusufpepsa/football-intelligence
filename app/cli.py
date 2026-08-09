@@ -1,7 +1,9 @@
 """Komut satırı arayüzü. `python -m app.cli <komut>` ile çalıştırılır."""
 import argparse
 import logging
+import re
 import sys
+import unicodedata
 from datetime import date, datetime, timedelta, timezone
 from difflib import SequenceMatcher
 
@@ -270,36 +272,97 @@ def cmd_backfill_seasons() -> None:
     logger.info("Toplam %s maç işlendi (backfill-seasons).", total_fixtures)
 
 
-def _resolve_team_name(
-    raw_name: str,
+# API-Football/football-data isim farkının en sık nedeni: kulüp tipi kısaltmaları.
+# Asıl çözüm _name_similarity'deki alt-küme kontrolü ("aik" ⊂ "aik stockholm" gibi
+# ekstra kelimeleri de yakalar) ama bu liste yakın-ama-tam-alt-küme-olmayan
+# durumlarda (difflib fallback'i için) ek yardım sağlar.
+GENERIC_CLUB_TOKENS = {"fc", "sk", "if", "is", "aik", "ff", "bk", "sc", "ac", "rb", "bsc", "ik", "gks", "cfr"}
+MAX_UNMATCHED_EXAMPLES = 10
+
+
+def _strip_accents(value: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", value)
+    return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+
+
+def _base_normalize(name: str) -> str:
+    """Küçük harf, aksan temizliği (ö->o, ą->a, ç->c, ...), noktalama temizliği."""
+    name = _strip_accents(name).lower()
+    name = re.sub(r"[.\-/']", " ", name)
+    name = re.sub(r"[^a-z0-9\s]", "", name)
+    return re.sub(r"\s+", " ", name).strip()
+
+
+def _strip_generic_tokens(normalized_name: str) -> str:
+    """Yaygın kulüp önek/soneklerini ve kuruluş yıllarını (4 haneli sayı) atar."""
+    words = [
+        w for w in normalized_name.split()
+        if w not in GENERIC_CLUB_TOKENS and not re.fullmatch(r"(18|19|20)\d{2}", w)
+    ]
+    return " ".join(words)
+
+
+def _words_overlap_score(a: str, b: str) -> float:
+    words_a, words_b = set(a.split()), set(b.split())
+    if words_a and words_b and (words_a <= words_b or words_b <= words_a):
+        return 1.0
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def _name_similarity(raw_a: str, raw_b: str) -> float:
+    """0-1 arası benzerlik. Biri diğerinin kelime alt kümesiyse ('aik' ⊂ 'aik stockholm')
+    tam eşleşme sayılır - bu, şehir/kulüp eki gibi farkları elle bir listeye yazmadan çözer.
+    Ayrıca jenerik kulüp tokenleri atılmış hallerinde de aynı kontrol denenir."""
+    base_a, base_b = _base_normalize(raw_a), _base_normalize(raw_b)
+    if not base_a or not base_b:
+        return 0.0
+
+    best = _words_overlap_score(base_a, base_b)
+
+    stripped_a, stripped_b = _strip_generic_tokens(base_a), _strip_generic_tokens(base_b)
+    if stripped_a and stripped_b:
+        best = max(best, _words_overlap_score(stripped_a, stripped_b))
+
+    return best
+
+
+def _match_fixture_by_date_and_names(
+    home_raw: str,
+    away_raw: str,
+    match_date: date,
+    fixtures_by_date: dict,
     alias_map: dict[str, int],
-    team_by_name: dict[str, int],
-    team_names: list[str],
-    new_aliases: list[dict],
-) -> int | None:
-    """team_aliases -> tam isim -> bulanık eşleştirme (eşik FUZZY_MATCH_THRESHOLD) sırasıyla dener."""
-    if raw_name in alias_map:
-        return alias_map[raw_name]
+) -> tuple:
+    """Önce lig+tarih (±1 gün) ile aday havuzunu küçültür (genelde 2-5 maç),
+    sonra o havuzda isim benzerliğiyle en iyi eşleşmeyi arar.
 
-    if raw_name in team_by_name:
-        team_id = team_by_name[raw_name]
-        alias_map[raw_name] = team_id
-        new_aliases.append({"team_id": team_id, "source": "football_data", "alias": raw_name})
-        return team_id
+    Döner: (fixture, skor, en_yakın_aday). Eşleşme bulunursa (fixture, skor, None),
+    bulunamazsa (None, en_iyi_skor, en_yakın_aday_veya_None).
+    """
+    candidates = []
+    for offset in (0, -1, 1):
+        candidates.extend(fixtures_by_date.get(match_date + timedelta(days=offset), []))
 
-    best_name, best_ratio = None, 0.0
-    for name in team_names:
-        ratio = SequenceMatcher(None, raw_name.lower(), name.lower()).ratio()
-        if ratio > best_ratio:
-            best_name, best_ratio = name, ratio
+    if not candidates:
+        return None, 0.0, None
 
-    if best_name is not None and best_ratio >= FUZZY_MATCH_THRESHOLD:
-        team_id = team_by_name[best_name]
-        alias_map[raw_name] = team_id
-        new_aliases.append({"team_id": team_id, "source": "football_data", "alias": raw_name})
-        return team_id
+    home_alias_id = alias_map.get(home_raw)
+    away_alias_id = alias_map.get(away_raw)
+    if home_alias_id is not None and away_alias_id is not None:
+        for f in candidates:
+            if f.home_team_id == home_alias_id and f.away_team_id == away_alias_id:
+                return f, 1.0, None
 
-    return None
+    best_fixture, best_score = None, 0.0
+    for f in candidates:
+        score = min(_name_similarity(home_raw, f.home_name), _name_similarity(away_raw, f.away_name))
+        if score > best_score:
+            best_fixture, best_score = f, score
+
+    if best_fixture is not None and best_score >= FUZZY_MATCH_THRESHOLD:
+        return best_fixture, best_score, None
+
+    return None, best_score, best_fixture
 
 
 def _backfill_league_odds(engine, league) -> tuple[int, int]:
@@ -312,8 +375,17 @@ def _backfill_league_odds(engine, league) -> tuple[int, int]:
         return 0, 0
 
     with engine.begin() as conn:
-        teams = conn.execute(
-            text("SELECT id, name FROM teams WHERE league_id = :league_id"),
+        fixtures = conn.execute(
+            text(
+                """
+                SELECT f.id, f.kickoff_utc, f.home_team_id, f.away_team_id,
+                       ht.name AS home_name, at.name AS away_name
+                FROM fixtures f
+                JOIN teams ht ON ht.id = f.home_team_id
+                JOIN teams at ON at.id = f.away_team_id
+                WHERE f.league_id = :league_id
+                """
+            ),
             {"league_id": league["id"]},
         ).all()
         existing_aliases = conn.execute(
@@ -326,20 +398,16 @@ def _backfill_league_odds(engine, league) -> tuple[int, int]:
             ),
             {"league_id": league["id"]},
         ).all()
-        fixtures = conn.execute(
-            text("SELECT id, home_team_id, away_team_id, kickoff_utc FROM fixtures WHERE league_id = :league_id"),
-            {"league_id": league["id"]},
-        ).all()
 
-    team_by_name = {t.name: t.id for t in teams}
-    team_names = list(team_by_name.keys())
+    fixtures_by_date: dict = {}
+    for f in fixtures:
+        fixtures_by_date.setdefault(f.kickoff_utc.date(), []).append(f)
     alias_map = {a.alias: a.team_id for a in existing_aliases}
-    fixture_lookup = {
-        (f.home_team_id, f.away_team_id, f.kickoff_utc.date()): (f.id, f.kickoff_utc) for f in fixtures
-    }
 
     new_aliases: list[dict] = []
+    new_alias_pairs: set[tuple[int, str]] = set()
     unmatched_rows: list[dict] = []
+    unmatched_examples: list[str] = []
     odds_rows: list[dict] = []
     matched = 0
     unmatched = 0
@@ -349,10 +417,7 @@ def _backfill_league_odds(engine, league) -> tuple[int, int]:
         away_raw = (row.get("Away") or "").strip()
         match_date = football_data.parse_match_date(row.get("Date"))
 
-        home_id = _resolve_team_name(home_raw, alias_map, team_by_name, team_names, new_aliases) if home_raw else None
-        away_id = _resolve_team_name(away_raw, alias_map, team_by_name, team_names, new_aliases) if away_raw else None
-
-        if home_id is None or away_id is None or match_date is None:
+        if not home_raw or not away_raw or match_date is None:
             unmatched += 1
             unmatched_rows.append({
                 "source": "football_data",
@@ -363,25 +428,35 @@ def _backfill_league_odds(engine, league) -> tuple[int, int]:
             })
             continue
 
-        # Bazı geç saat maçlarında yerel tarih ile UTC tarihi bir gün kayabilir.
-        fixture_entry = (
-            fixture_lookup.get((home_id, away_id, match_date))
-            or fixture_lookup.get((home_id, away_id, match_date - timedelta(days=1)))
-            or fixture_lookup.get((home_id, away_id, match_date + timedelta(days=1)))
+        fixture, score, best_candidate = _match_fixture_by_date_and_names(
+            home_raw, away_raw, match_date, fixtures_by_date, alias_map,
         )
-        if fixture_entry is None:
+
+        if fixture is None:
             unmatched += 1
             unmatched_rows.append({
-                "source": "football_data",
-                "raw_home": home_raw,
-                "raw_away": away_raw,
-                "raw_date": match_date,
-                "seen_at": datetime.now(timezone.utc),
+                "source": "football_data", "raw_home": home_raw, "raw_away": away_raw,
+                "raw_date": match_date, "seen_at": datetime.now(timezone.utc),
             })
+            if len(unmatched_examples) < MAX_UNMATCHED_EXAMPLES:
+                if best_candidate is not None:
+                    unmatched_examples.append(
+                        f"DB: '{best_candidate.home_name}' vs '{best_candidate.away_name}' "
+                        f"↔ CSV: '{home_raw}' vs '{away_raw}' ({match_date}, skor={score:.2f})"
+                    )
+                else:
+                    unmatched_examples.append(
+                        f"CSV: '{home_raw}' vs '{away_raw}' ({match_date}) ↔ bu tarih civarında ligde kayıtlı maç yok"
+                    )
             continue
 
-        fixture_id, kickoff_utc = fixture_entry
         matched += 1
+        if (fixture.home_team_id, home_raw) not in new_alias_pairs:
+            new_alias_pairs.add((fixture.home_team_id, home_raw))
+            new_aliases.append({"team_id": fixture.home_team_id, "source": "football_data", "alias": home_raw})
+        if (fixture.away_team_id, away_raw) not in new_alias_pairs:
+            new_alias_pairs.add((fixture.away_team_id, away_raw))
+            new_aliases.append({"team_id": fixture.away_team_id, "source": "football_data", "alias": away_raw})
 
         odds = football_data.extract_closing_odds(row)
         if odds is None:
@@ -389,14 +464,20 @@ def _backfill_league_odds(engine, league) -> tuple[int, int]:
 
         if odds["average"] is not None:
             odds_rows.append({
-                "fixture_id": fixture_id, "source": "football_data_avg", "market": "1x2",
-                "odds": odds["average"], "captured_at": kickoff_utc, "is_closing": True,
+                "fixture_id": fixture.id, "source": "football_data_avg", "market": "1x2",
+                "odds": odds["average"], "captured_at": fixture.kickoff_utc, "is_closing": True,
             })
         if odds["max"] is not None:
             odds_rows.append({
-                "fixture_id": fixture_id, "source": "football_data_max", "market": "1x2",
-                "odds": odds["max"], "captured_at": kickoff_utc, "is_closing": True,
+                "fixture_id": fixture.id, "source": "football_data_max", "market": "1x2",
+                "odds": odds["max"], "captured_at": fixture.kickoff_utc, "is_closing": True,
             })
+
+    if unmatched_examples:
+        logger.info(
+            "%s - eşleşmeyen %s kayıttan örnekler:\n  %s",
+            league["name"], unmatched, "\n  ".join(unmatched_examples),
+        )
 
     with engine.begin() as conn:
         bulk_insert(
